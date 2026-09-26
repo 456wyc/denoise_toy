@@ -111,6 +111,12 @@ class ANCApp:
                                       values=("low", "high"), width=8)
         self.lat_combo.grid(row=0, column=5, sticky="w", padx=6)
 
+        row4 = ttk.Frame(par)
+        row4.pack(fill="x", pady=(6, 0))
+        self.wasapi_exc_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row4, text="WASAPI 独占模式（更低延迟，但会独占音频设备，其他程序无法发声）",
+                        variable=self.wasapi_exc_var).pack(side="left")
+
         # ---- 降噪控制 ----
         anc = ttk.LabelFrame(outer, text="3. 降噪控制（可实时调整）", padding=8)
         anc.pack(fill="x", **pad)
@@ -136,6 +142,16 @@ class ANCApp:
         gain_scale.pack(side="left", fill="x", expand=True, padx=8)
         self.gain_lbl = ttk.Label(gain_row, text="1.00")
         self.gain_lbl.pack(side="left")
+
+        # 延迟补偿：微调反相波的播放时机，找到最佳相位抵消点
+        self.delay_var = tk.IntVar(value=0)
+        delay_row = ttk.Frame(anc)
+        delay_row.pack(fill="x", pady=2)
+        ttk.Label(delay_row, text="相位延迟(样本)").pack(side="left")
+        ttk.Scale(delay_row, from_=0, to=128, variable=self.delay_var,
+                  command=self._on_delay_change).pack(side="left", fill="x", expand=True, padx=8)
+        self.delay_lbl = ttk.Label(delay_row, text="0 samples / 0.00 ms")
+        self.delay_lbl.pack(side="left")
 
         # 反相波低通：只保留可抵消的低频段，避免中高频被当成额外噪声放大
         self.lpf_var = tk.BooleanVar(value=True)
@@ -228,6 +244,7 @@ class ANCApp:
         e.samplerate = int(self.sr_var.get())
         e.blocksize = int(self.bs_var.get())
         e.latency = self.lat_var.get()
+        e.wasapi_exclusive = bool(self.wasapi_exc_var.get())
         in_sel = self._in_map.get(self.in_var.get())
         out_sel = self._out_map.get(self.out_var.get())
         e.input_device = in_sel if in_sel is not None else None
@@ -283,6 +300,14 @@ class ANCApp:
         except (ValueError, tk.TclError):
             pass
         self.lpf_lbl.config(text=f"{int(self.engine.lpf_cutoff)}Hz")
+
+    def _on_delay_change(self, _val) -> None:
+        try:
+            self.engine.delay_samples = int(self.delay_var.get())
+        except (ValueError, tk.TclError):
+            pass
+        ms = self.engine.delay_samples / self.engine.samplerate * 1000.0
+        self.delay_lbl.config(text=f"{self.engine.delay_samples} samples / {ms:.2f} ms")
 
     def _on_gain_change(self, _val) -> None:
         try:

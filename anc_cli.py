@@ -64,11 +64,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--mode", choices=MODES, default="anc",
                    help="off=静音 / monitor=透传监听 / anc=降噪")
     p.add_argument("--gain", type=float, default=1.0, help="反相波增益（降噪强度）")
+    p.add_argument("--delay", type=int, default=0,
+                   help="相位延迟补偿(样本数)，微调反相波时机以找到最佳抵消点")
     p.add_argument("--lpf-cutoff", type=float, default=150.0,
                    help="反相波低通截止频率(Hz)，只保留可抵消的低频段；0 表示关闭")
     p.add_argument("--samplerate", type=int, default=48000, help="采样率")
     p.add_argument("--blocksize", type=int, default=128, help="块大小（越小延迟越低）")
     p.add_argument("--latency", choices=("low", "high"), default="low", help="延迟档")
+    p.add_argument("--wasapi-exclusive", action="store_true",
+                   help="WASAPI 独占模式（更低延迟，但会独占设备，其他程序无法发声）")
     p.add_argument("--music", type=str, default=None, help="边降噪边循环播放的 WAV 文件")
     p.add_argument("--music-gain", type=float, default=1.0, help="音乐音量")
     args = p.parse_args(argv)
@@ -81,9 +85,11 @@ def main(argv: list[str] | None = None) -> int:
     engine.output_device = args.output
     engine.mode = args.mode
     engine.gain = args.gain
+    engine.delay_samples = args.delay
     engine.samplerate = args.samplerate
     engine.blocksize = args.blocksize
     engine.latency = args.latency
+    engine.wasapi_exclusive = args.wasapi_exclusive
     engine.playback_gain = args.music_gain
     if args.lpf_cutoff <= 0:
         engine.lpf_enabled = False
@@ -103,9 +109,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("降噪已启动，按 Ctrl+C 退出。")
-    print(f"  模式={engine.mode}  增益={engine.gain:.2f}  "
+    delay_ms = engine.delay_samples / engine.samplerate * 1000.0
+    print(f"  模式={engine.mode}  增益={engine.gain:.2f}  延迟补偿={engine.delay_samples} samples ({delay_ms:.2f} ms)  "
           f"低通={'关' if not engine.lpf_enabled else f'{int(engine.lpf_cutoff)}Hz'}  "
-          f"采样率={engine.samplerate}  块={engine.blocksize}  延迟档={engine.latency}")
+          f"采样率={engine.samplerate}  块={engine.blocksize}  "
+          f"延迟档={engine.latency}  WASAPI独占={'开' if engine.wasapi_exclusive else '关'}")
 
     def on_int(_sig, _frame):
         raise KeyboardInterrupt

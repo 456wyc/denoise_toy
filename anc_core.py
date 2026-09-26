@@ -189,10 +189,14 @@ class ANCEngine:
         self.input_channels: int = 1
         self.output_channels: int = 2
         self.latency: str = "low"                 # 'low' | 'high'
+        self.wasapi_exclusive: bool = False       # WASAPI 独占模式（更低延迟，独占设备）
 
         # ---- 降噪 / 播放参数 ----
         self.mode: str = MODE_OFF
         self.gain: float = 1.0                    # 反相波（或监听）增益
+        self.delay_samples: int = 0               # 延迟补偿（样本数），微调反相波相位
+        self._delay_buf: Optional[np.ndarray] = None
+        self._delay_pos: int = 0
         self.playback_gain: float = 1.0           # 音乐音量
         self._playback: Optional[np.ndarray] = None
         self._playback_pos: int = 0
@@ -207,6 +211,7 @@ class ANCEngine:
         # ---- 监测 ----
         self.in_level: float = 0.0                # 输入 RMS 电平
         self.out_level: float = 0.0               # 输出 RMS 电平
+        self.noise_reduction_db: float = 0.0      # 估算降噪量(dB)：监听→ANC 的输出电平差
         self._clip_count: int = 0
         self._xrun_count: int = 0
 
@@ -283,6 +288,45 @@ class ANCEngine:
             self._lpf_cut = self.lpf_cutoff
         return self._lpf
 
+    def _ensure_delay_buf(self, max_delay: int) -> None:
+        """确保延迟缓冲至少有 max_delay+blocksize 的容量。"""
+        needed = max_delay + self.blocksize * 2
+        if self._delay_buf is None or len(self._delay_buf) < needed:
+            self._delay_buf = np.zeros(needed, dtype=np.float32)
+            self._delay_pos = 0
+
+    def _delay_push(self, samples: np.ndarray) -> None:
+        """把 samples 写入延迟环形缓冲（最新的在尾部）。"""
+        buf = self._delay_buf
+        n = len(samples)
+        pos = self._delay_pos
+        buf_len = len(buf)
+        # 写入新样本（环形）
+        if pos + n <= buf_len:
+            buf[pos:pos + n] = samples
+            self._delay_pos = pos + n
+        else:
+            part1 = buf_len - pos
+            buf[pos:] = samples[:part1]
+            buf[:n - part1] = samples[part1:]
+            self._delay_pos = n - part1
+
+    def _delay_read_delayed(self, frames: int, delay: int) -> np.ndarray:
+        """从延迟缓冲中读出 delay 样本前的 frames 个样本。"""
+        buf = self._delay_buf
+        buf_len = len(buf)
+        # "最新样本位置"是 self._delay_pos - 1（刚 push 完的末尾）。
+        # 要读 delay 样本前的 frames 个，起点是 (self._delay_pos - delay - frames) % buf_len
+        start = (self._delay_pos - delay - frames) % buf_len
+        out = np.zeros(frames, dtype=np.float32)
+        if start + frames <= buf_len:
+            out[:] = buf[start:start + frames]
+        else:
+            part1 = buf_len - start
+            out[:part1] = buf[start:]
+            out[part1:] = buf[:frames - part1]
+        return out
+
     def _callback(self, indata, outdata, frames, time_info, status) -> None:
         if status:
             self._xrun_count += 1
@@ -292,7 +336,15 @@ class ANCEngine:
             self.in_level = float(np.sqrt(np.mean(noise * noise)) + 1e-12)
 
             if self.mode == MODE_ANC:
-                out = -self.gain * noise          # 相位反转 → 反相波
+                # 延迟线：把当前样本写入缓冲，再读出 delay_samples 之前的
+                # 通过微调 delay_samples 可以改变反相波的相位，找到最佳抵消点
+                self._ensure_delay_buf(max(self.delay_samples, 0))
+                self._delay_push(noise)
+                if self.delay_samples > 0:
+                    delayed = self._delay_read_delayed(frames, self.delay_samples)
+                else:
+                    delayed = noise
+                out = -self.gain * delayed          # 相位反转 → 反相波
                 if self.lpf_enabled:
                     out = self._get_lpf().process(out)  # 只保留可抵消的低频段
             elif self.mode == MODE_MONITOR:
@@ -326,6 +378,16 @@ class ANCEngine:
         self._clip_count = 0
         self.error = None
         self._lpf = None  # 重置滤波器状态，避免残留旧延迟
+        self._delay_buf = None  # 重置延迟缓冲
+
+        extra_settings = None
+        if self.wasapi_exclusive:
+            try:
+                extra_settings = sd.WasapiSettings(exclusive=True, auto_convert=True)
+            except AttributeError:
+                # 老版本 sounddevice 可能没有 WasapiSettings
+                self.error = "当前 sounddevice 版本不支持 WASAPI 独占设置，请升级 sounddevice"
+
         self._stream = sd.Stream(
             samplerate=self.samplerate,
             blocksize=self.blocksize,
@@ -333,6 +395,7 @@ class ANCEngine:
             channels=(self.input_channels, self.output_channels),
             dtype="float32",
             latency=self.latency,
+            extra_settings=extra_settings,
             callback=self._callback,
         )
         self._stream.start()
